@@ -1,0 +1,409 @@
+// module1_parser.h
+
+#ifndef MODULE1_PARSER_H
+#define MODULE1_PARSER_H
+
+#define MAX_TOKENS 128
+#define MAX_CMD_LENGTH 1024
+
+typedef enum {
+    TOK_NORMAL,
+    TOK_INPUT,       // <
+    TOK_OUTPUT,      // >
+    TOK_OUTPUT_APPEND, // >>
+    TOK_PIPE         // |
+} token_type_t;
+
+typedef struct {
+    token_type_t type;
+    char *text;      // token string
+} token_t;
+
+typedef struct {
+    int num_tokens;
+    token_t tokens[MAX_TOKENS];
+} token_list_t;
+
+// Data structure representing one command segment (between pipes)
+typedef struct {
+    char *argv[MAX_TOKENS];  // NULL-terminated argv for execvp
+    char *in_file;           // filename for '<'
+    char *out_file;          // filename for '>' or '>>'
+    int append;              // 1 if >>, 0 otherwise
+} command_t;
+
+// parse_input: read, tokenize, build token_list_t
+int parse_input(const char *input_line, token_list_t *toks);
+
+// build_command_segments: split tokens around pipes into commands[]
+// returns number of commands
+int build_command_segments(token_list_t *toks, command_t commands[]);
+
+#endif // MODULE1_PARSER_H
+// module1_parser.c
+
+#include "module1_parser.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// Helper: duplicate a substring
+static char *substr_dup(const char *start, size_t len) {
+    char *s = malloc(len + 1);
+    strncpy(s, start, len);
+    s[len] = '\0';
+    return s;
+}
+
+// parse_input: tokenize input into token_list
+int parse_input(const char *input_line, token_list_t *toks) {
+    toks->num_tokens = 0;
+    const char *p = input_line;
+
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n')
+            p++;
+        if (*p == '\0') break;
+
+        if (toks->num_tokens >= MAX_TOKENS - 1) break;
+
+        token_t *tok = &toks->tokens[toks->num_tokens++];
+
+        if (*p == '<') {
+            tok->type = TOK_INPUT;
+            tok->text = strdup("<");
+            p++;
+        } else if (*p == '|') {
+            tok->type = TOK_PIPE;
+            tok->text = strdup("|");
+            p++;
+        } else if (*p == '>') {
+            p++;
+            if (*p == '>') {
+                tok->type = TOK_OUTPUT_APPEND;
+                tok->text = strdup(">>");
+                p++;
+            } else {
+                tok->type = TOK_OUTPUT;
+                tok->text = strdup(">");
+            }
+        } else {
+            // normal token until whitespace or special char
+            const char *start = p;
+            while (*p && *p!=' ' && *p!='\t' && *p!='\n'
+                   && *p!='<' && *p!='>' && *p!='|')
+                p++;
+            tok->type = TOK_NORMAL;
+            tok->text = substr_dup(start, p - start);
+        }
+    }
+
+    return toks->num_tokens;
+}
+
+// build_command_segments: populate commands[] from tokens
+int build_command_segments(token_list_t *toks, command_t commands[]) {
+    int cmd_idx = 0;
+    int arg_idx = 0;
+    command_t *cmd = &commands[cmd_idx];
+    memset(cmd, 0, sizeof(*cmd));
+
+    for (int i = 0; i < toks->num_tokens; i++) {
+        token_t *tok = &toks->tokens[i];
+
+        if (tok->type == TOK_PIPE) {
+            // finalize current command
+            cmd->argv[arg_idx] = NULL;
+            cmd_idx++;
+            arg_idx = 0;
+            cmd = &commands[cmd_idx];
+            memset(cmd, 0, sizeof(*cmd));
+        }
+        else if (tok->type == TOK_INPUT) {
+            // next token is filename
+            i++;
+            if (i < toks->num_tokens && toks->tokens[i].type == TOK_NORMAL) {
+                cmd->in_file = strdup(toks->tokens[i].text);
+            }
+        }
+        else if (tok->type == TOK_OUTPUT || tok->type == TOK_OUTPUT_APPEND) {
+            int append = (tok->type == TOK_OUTPUT_APPEND);
+            i++;
+            if (i < toks->num_tokens && toks->tokens[i].type == TOK_NORMAL) {
+                cmd->out_file = strdup(toks->tokens[i].text);
+                cmd->append = append;
+            }
+        }
+        else if (tok->type == TOK_NORMAL) {
+            cmd->argv[arg_idx++] = strdup(tok->text);
+        }
+    }
+
+    // finalize last command
+    cmd->argv[arg_idx] = NULL;
+    return cmd_idx + 1;
+}
+#ifndef MODULE2_BUILTIN_H
+#define MODULE2_BUILTIN_H
+
+// Returns 1 if built-in handled; 0 otherwise
+int handle_builtin(char *argv[]);
+
+#endif // MODULE2_BUILTIN_H
+#include "module2_builtin.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static void builtin_pwd(void) {
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd)))
+        printf("%s\n", cwd);
+    else
+        perror("pwd");
+}
+
+static void builtin_cd(char *argv[]) {
+    char *path = argv[1] ? argv[1] : getenv("HOME");
+    if (chdir(path) != 0)
+        perror("cd");
+}
+
+static void builtin_exit(char *argv[]) {
+    int status = argv[1] ? atoi(argv[1]) : 0;
+    exit(status);
+}
+
+int handle_builtin(char *argv[]) {
+    if (!argv || !argv[0]) return 0;
+    if (strcmp(argv[0], "cd") == 0) { builtin_cd(argv); return 1; }
+    if (strcmp(argv[0], "pwd") == 0) { builtin_pwd(); return 1; }
+    if (strcmp(argv[0], "exit") == 0) { builtin_exit(argv); return 1; }
+    return 0;
+}
+#ifndef MODULE3_EXECUTE_H
+#define MODULE3_EXECUTE_H
+
+#include "module1_parser.h"
+
+// Executes one command (no pipes), handles I/O redirection.
+// Returns exit status of the command, or -1 on failure.
+int execute_command(command_t *cmd);
+
+#endif // MODULE3_EXECUTE_H
+#include "module3_execute.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <string.h>  // for strerror
+#include <errno.h>   // for errno
+
+int execute_command(command_t *cmd) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return -1;
+    }
+
+    if (pid == 0) {
+        // Child process
+        if (cmd->in_file) {
+            int infd = open(cmd->in_file, O_RDONLY);
+            if (infd < 0) {
+                fprintf(stderr,
+                        "Error opening input file '%s': %s\n",
+                        cmd->in_file, strerror(errno));
+                exit(1);
+            }
+            dup2(infd, STDIN_FILENO);
+            close(infd);
+        }
+
+        if (cmd->out_file) {
+            int flags = O_CREAT | O_WRONLY |
+                        (cmd->append ? O_APPEND : O_TRUNC);
+            int outfd = open(cmd->out_file, flags, 0644);
+            if (outfd < 0) {
+                fprintf(stderr,
+                        "Error opening output file '%s': %s\n",
+                        cmd->out_file, strerror(errno));
+                exit(1);
+            }
+            dup2(outfd, STDOUT_FILENO);
+            close(outfd);
+        }
+
+        execvp(cmd->argv[0], cmd->argv);
+        fprintf(stderr, "exec failed: %s: %s\n",
+                cmd->argv[0], strerror(errno));
+        exit(1);
+
+    } else {
+        // Parent process
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status))
+            return WEXITSTATUS(status);
+        return -1;
+    }
+}
+#ifndef MODULE4_PIPELINE_H
+#define MODULE4_PIPELINE_H
+
+#include "module1_parser.h"
+
+// Execute multiple commands connected via pipes.
+// commands[] holds ncmd commands built by build_command_segments().
+void execute_pipeline(command_t commands[], int ncmd);
+
+#endif // MODULE4_PIPELINE_H
+#include "module4_pipeline.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+
+// Based on typical multi-pipe shell implementations :contentReference[oaicite:1]{index=1}
+void execute_pipeline(command_t commands[], int ncmd) {
+    int num_pipes = ncmd - 1;
+    int pipefds[2 * num_pipes];
+
+    // Create all needed pipes
+    for (int i = 0; i < num_pipes; ++i) {
+        if (pipe(pipefds + i*2) < 0) {
+            perror("pipe");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    for (int i = 0; i < ncmd; ++i) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            exit(EXIT_FAILURE);
+        }
+        if (pid == 0) {
+            // If not first command -> redirect stdin to previous pipe read end
+            if (i > 0) {
+                dup2(pipefds[(i-1)*2], STDIN_FILENO);
+            }
+            // If not last command -> redirect stdout to current pipe write end
+            if (i < num_pipes) {
+                dup2(pipefds[i*2 + 1], STDOUT_FILENO);
+            }
+
+            // Close all inherited pipe fds
+            for (int j = 0; j < 2 * num_pipes; ++j)
+                close(pipefds[j]);
+
+            // Apply input redirection (<)
+            if (commands[i].in_file) {
+                int fd = open(commands[i].in_file, O_RDONLY);
+                if (fd < 0) { perror("open in_file"); exit(EXIT_FAILURE); }
+                dup2(fd, STDIN_FILENO);
+                close(fd);
+            }
+            // Apply output redirection (> or >>)
+            if (commands[i].out_file) {
+                int flags = O_CREAT | O_WRONLY | (commands[i].append ? O_APPEND : O_TRUNC);
+                int fd = open(commands[i].out_file, flags, 0644);
+                if (fd < 0) { perror("open out_file"); exit(EXIT_FAILURE); }
+                dup2(fd, STDOUT_FILENO);
+                close(fd);
+            }
+
+            execvp(commands[i].argv[0], commands[i].argv);
+            perror(commands[i].argv[0]);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    // Parent closes all pipe file descriptors
+    for (int i = 0; i < 2 * num_pipes; ++i)
+        close(pipefds[i]);
+
+    // Wait for all child processes
+    for (int i = 0; i < ncmd; ++i)
+        wait(NULL);
+}
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+#include "module1_parser.h"
+#include "module2_builtin.h"
+#include "module4_pipeline.h"
+
+#define MAX_CMDS 10
+
+// Execute a single command with optional redirection
+void execute_command(command_t *cmd) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (cmd->in_file) {
+            freopen(cmd->in_file, "r", stdin);
+        }
+        if (cmd->out_file) {
+            const char *mode = cmd->append ? "a" : "w";
+            freopen(cmd->out_file, mode, stdout);
+        }
+        execvp(cmd->argv[0], cmd->argv);
+        perror("execvp");
+        exit(EXIT_FAILURE);
+    } else if (pid < 0) {
+        perror("fork");
+        exit(EXIT_FAILURE);
+    } else {
+        wait(NULL);
+    }
+}
+
+int main() {
+    char line[MAX_CMD_LENGTH];
+    token_list_t toks;
+    command_t cmds[MAX_CMDS];
+
+    while (1) {
+        // Display prompt
+        printf("minishell> ");
+        fflush(stdout);
+
+        if (!fgets(line, sizeof(line), stdin))
+            break; // EOF or error
+
+        int ntok = parse_input(line, &toks);
+        if (ntok <= 0)
+            continue;
+
+        int ncmd = build_command_segments(&toks, cmds);
+        if (ncmd <= 0)
+            continue;
+
+        // Handle each command
+        if (ncmd == 1) {
+            command_t *c = &cmds[0];
+            if (c->argv[0] && handle_builtin(c->argv)) {
+                // Built-in executed, do nothing
+            } else {
+                execute_command(c);
+            }
+        } else {
+            // Pipeline: built-ins won't be supported inside a pipe
+            execute_pipeline(cmds, ncmd);
+        }
+
+        // Free tokens
+        for (int i = 0; i < ntok; i++) {
+            free(toks.tokens[i].text);
+        }
+        // (Note: argv/freeing of in_file/out_file handled in pipeline or exec)
+    }
+
+    return 0;
+}
